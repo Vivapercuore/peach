@@ -13,8 +13,8 @@ from peach.community_catalog import COMMUNITY_SOURCES, IMAGE_LIMIT, _download, c
 from peach.http import HttpResponse
 from peach.jav_cover_fetch import Candidate, NotFound, Unavailable, _fetch
 from peach.javdb_genres import page_genres
-from peach.javdb_public import (PUBLIC_API, PublicIdentityAmbiguous, PublicNotFound, PublicSourcePaused,
-                                PublicSourceUnavailable)
+from peach.javdb_public import (PUBLIC_API, PublicBudgetExceeded, PublicIdentityAmbiguous, PublicNotFound,
+                                PublicSourcePaused, PublicSourceUnavailable)
 from peach.library_processing import _previous_order
 from peach.scraping_access import SourcePaused
 from peach.sources import (SITE_SOURCES, AVBaseSource, FailureReason, JavBusSource, JavDBPublicSource, JavDBSource,
@@ -529,24 +529,35 @@ class PublicSourceTests(unittest.TestCase):
         payload = public_record(movie).payload()
         self.assertEqual((payload["maker"], payload["label"], payload["genres"]), ("", "至高ぷれみあ！", ["私人攝影"]))
 
-    def test_query_maps_public_failures_without_holding_the_page_cooldown(self):
+    def test_query_maps_public_answers_without_holding_the_page_cooldown(self):
         session = Session(serve({}))
-        cases = ((PublicNotFound("没有"), SourceFailure, FailureReason.NOT_FOUND),
-                 (PublicIdentityAmbiguous("同番号对应多个作品"), SourceFailure, FailureReason.PARSE_ERROR),
-                 (PublicSourceUnavailable("未取得"), SourceFailure, FailureReason.NETWORK),
-                 (PublicSourcePaused("暂时不可用"), SourcePaused, None))
-        for error, kind, reason in cases:
+        cases = ((PublicNotFound("没有"), FailureReason.NOT_FOUND),
+                 (PublicIdentityAmbiguous("同番号对应多个作品"), FailureReason.PARSE_ERROR),
+                 (PublicBudgetExceeded("超出预算"), FailureReason.TIMEOUT))
+        for error, reason in cases:
             with self.subTest(error=type(error).__name__), patch.object(PUBLIC_API, "movie", side_effect=error):
-                with self.assertRaises(kind) as caught:
+                with self.assertRaises(SourceFailure) as caught:
                     JavDBPublicSource().query("ABW-358", session=session)
-                if reason is not None:
-                    self.assertEqual(caught.exception.reason, reason)
-                    self.assertEqual(caught.exception.cooldown_action, "")
+                self.assertEqual(caught.exception.reason, reason)
+                self.assertEqual(caught.exception.cooldown_action, "")
         with patch.object(PUBLIC_API, "movie", side_effect=PublicIdentityAmbiguous("x")):
             with self.assertRaises(SourceFailure) as caught:
                 JavDBPublicSource().query("ABW-358", session=session)
         self.assertEqual(caught.exception.detail, "identity_ambiguous")
         self.assertIs(SITE_SOURCES["javdb"], JavDBPublicSource)
+
+    def test_query_reads_the_detail_page_when_the_api_cannot_answer(self):
+        pages = {JAVDB_SEARCH: JAVDB_RESULTS, JAVDB_DETAIL: JAVDB_PAGE}
+        for error in (PublicSourceUnavailable("請登錄帳號"), PublicSourcePaused("暂时不可用")):
+            with self.subTest(error=type(error).__name__), patch.object(PUBLIC_API, "movie", side_effect=error):
+                record = JavDBPublicSource().query("ABW-358", session=Session(serve(pages)))
+            self.assertEqual((record.source, record.provenance, record.code), ("javdb", "javdb-page", "ABW-358"))
+            self.assertEqual(record.payload(), work(JavDBSource(), pages, "ABW-358"))
+        with patch.object(PUBLIC_API, "movie", side_effect=PublicSourceUnavailable("請登錄帳號")):
+            with self.assertRaises(SourceFailure) as caught:
+                JavDBPublicSource().query("ABW-358", session=Session(serve({
+                    JAVDB_SEARCH: "<title>登入 | JavDB</title>".encode()})))
+        self.assertEqual(caught.exception.reason, FailureReason.AUTH_REQUIRED, "详情页那一问的失败按详情页分档")
 
     def test_query_returns_the_public_record(self):
         with patch.object(PUBLIC_API, "movie", return_value=PUBLIC_MOVIE) as movie:

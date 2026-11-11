@@ -9,8 +9,8 @@ MGS 的 5/23、标题带 MGS 附注、演员里有男优，各字段按 Peach �
 
 一部分页面要登录才给，回的是登入页而不是 401/403（`peach.javdb.LOGIN`），搜索页与详情页都要认。
 
-刮削不读详情页，走 `JavDBPublicSource` 的匿名接口（ADR-0144）：不带 Cookie，不占 javdb.com
-的出口配额，字段投影成与详情页同形的记录。详情页解析留给视频预览。
+刮削先走 `JavDBPublicSource` 的匿名接口（ADR-0144）：不带 Cookie，不占 javdb.com
+的出口配额，字段投影成与详情页同形的记录。接口冷却或未取得时退回详情页（ADR-0157）；详情页解析也供视频预览。
 """
 from __future__ import annotations
 
@@ -166,19 +166,28 @@ def public_record(movie: dict) -> SiteRecord:
         extra={"origin_title": origin, "display_title": display, "source_id": movie_id, "javdb_rule": RULE})
 
 
-class JavDBPublicSource(JavDBSource):
-    """刮削的 javdb 一问：匿名接口取资料，失败按缺失、歧义、冷却与未取得分档。
+class _PublicDown(Exception):
+    """匿名接口这一问没答（冷却或未取得），交给详情页那条路。"""
 
-    接口的问题不写 `javdb` 的来源冷却：那份冷却管的是详情页那条路（视频预览），
-    接口自己按 `PUBLIC_API` 的冷却停下，这里翻成 `SourcePaused`，本趟记作没轮到。
+
+class JavDBPublicSource(JavDBSource):
+    """刮削的 javdb 一问：匿名接口取资料，缺失、歧义与预算按接口的结论分档。
+
+    接口冷却或未取得时改读详情页（ADR-0157）：2026-11-10 起接口三家主机都要求登录，详情页匿名仍给
+    全部面板字段。详情页那一问按 `javdb` 这一站的主机间隔与来源冷却走，失败按详情页的分档交出。
     """
 
     DEFAULT = JAVDB_PUBLIC
 
     def query(self, code: str, *, session: Session) -> SiteRecord:
+        try:
+            return self._public_query(code, session=session)
+        except _PublicDown:
+            return JavDBSource(JAVDB).query(code, session=session)
+
+    def _public_query(self, code: str, *, session: Session) -> SiteRecord:
         from ..javdb_public import (PUBLIC_API, PublicBudgetExceeded, PublicIdentityAmbiguous, PublicNotFound,
-                                    PublicRequestBudget, PublicSourcePaused, PublicSourceUnavailable)
-        from ..scraping_access import SourcePaused
+                                    PublicRequestBudget, PublicSourceUnavailable)
         seconds = PUBLIC_SECONDS if session.deadline is None else session.deadline - time.monotonic()
         budget = PublicRequestBudget(max_requests=PUBLIC_REQUESTS, max_seconds=max(1.0, seconds))
         with self.holding(session):
@@ -189,12 +198,10 @@ class JavDBPublicSource(JavDBSource):
                 raise SourceFailure(FailureReason.PARSE_ERROR, f"javdb {error}", detail="identity_ambiguous") from None
             except PublicNotFound:
                 raise SourceFailure(FailureReason.NOT_FOUND, "javdb 没有这个番号") from None
-            except PublicSourcePaused as error:
-                raise SourcePaused(f"javdb：{error}") from None
             except PublicBudgetExceeded:
                 raise SourceFailure(FailureReason.TIMEOUT, "javdb 作品资料在本次预算内未取得") from None
-            except PublicSourceUnavailable as error:
-                raise SourceFailure(FailureReason.NETWORK, f"javdb：{error}") from None
+            except PublicSourceUnavailable:
+                raise _PublicDown() from None
             return public_record(movie)
 
 
